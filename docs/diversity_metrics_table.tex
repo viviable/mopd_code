@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Method & Distinct-2 $\uparrow$ & Unique Ratio $\uparrow$ & Self-BLEU-4 $\downarrow$ & AST Jaccard $\uparrow$ \\
+\midrule
+MOPD & 0.141 & 0.743 & 0.898 & 0.129 \\
+base & 0.111 & 0.940 & 0.808 & 0.092 \\
+SDPO & 0.110 & 0.872 & 0.788 & 0.110 \\
+\bottomrule
+\end{tabular}
+\caption{Method-level diversity metrics on the LCB-v6 rollout set.
+Higher is better for Distinct-2, Unique Ratio, and AST Jaccard, while lower is
+better for Self-BLEU-4.}
+\label{tab:diversity-metrics}
+\end{table}

@@ -1,0 +1,238 @@
+\section{Appendix: SDPO-Fail, MOPD-Succeed Case Studies}
+\label{sec:appendix-case-studies}
+
+We focus here on prompts where the SDPO checkpoint still fails but the MOPD
+checkpoint already succeeds.
+Rather than emphasizing later rollout repair, these examples isolate a cleaner
+checkpoint-level qualitative gap: both models see the same task, but MOPD is
+more likely to preserve the crucial semantic distinction needed for a correct
+program.
+
+\subsection{Case Study 1: MOPD succeeds on a prompt where SDPO keeps the identifier-space error}
+
+\paragraph{Candidate pair.}
+The bib-mapping task provides a direct SDPO-versus-MOPD comparison.
+At line 92, the SDPO checkpoint sample in
+\texttt{diversoty\_sdpo\_50/50.jsonl} fails with accuracy $0.175$,
+while the MOPD checkpoint sample in
+\texttt{diversoty\_mopd\_50/50.jsonl} solves the same prompt perfectly.
+
+\paragraph{SDPO failure.}
+The SDPO trajectory mixes up the role of the permutation arrays and writes:
+\begin{verbatim}
+bib_to_person = [0] * (N + 1)
+for i in range(N):
+    bib_to_person[Q[i]] = P[i]
+
+result = [str(bib_to_person[Q[i]]) for i in range(N)]
+\end{verbatim}
+This is incorrect in two ways.
+First, \texttt{P[i]} is the stared-at person, not the wearer of bib
+\texttt{Q[i]}; second, the final answer again stops in person-ID space instead
+of projecting back to the bib number of the target person.
+The resulting program preserves the rough shape of the mapping task but
+composes the wrong relations.
+
+\paragraph{MOPD success.}
+The corresponding MOPD sample keeps the two identifier spaces separate:
+\begin{verbatim}
+bib_to_person = [0] * (N + 1)
+for i in range(N):
+    bib_to_person[Q[i]] = i + 1
+
+for i in range(1, N + 1):
+    person = bib_to_person[i]
+    target_person = P[person - 1]
+    result.append(str(Q[target_person - 1]))
+\end{verbatim}
+This trajectory performs the full chain correctly:
+\texttt{bib} $\rightarrow$ \texttt{wearing person}
+$\rightarrow$ \texttt{stared-at person}
+$\rightarrow$ \texttt{target bib}.
+
+\paragraph{Takeaway.}
+This example shows a checkpoint-level separation rather than a later repair:
+SDPO still exhibits identifier-space confusion, whereas MOPD already produces
+the correct symbolic composition on the same prompt.
+
+\subsection{Direct training-time evidence: the MOPD teacher is explicitly exposed to the same identifier-confusion failure}
+
+\paragraph{A same-step mixed peer pool already exists at the start of training.}
+The bib-mapping prompt above is not only a checkpoint-level contrast; it also
+appears as a mixed success/failure peer group inside the MOPD rollout stream at
+training step 1.
+In
+\texttt{.../PTrue-ATrue-FTrue-.../1.jsonl},
+this prompt has eight peers in the same rollout group:
+seven fail and one succeeds
+(the successful sample is line 189; failed peers include lines 14, 15, 51, 78,
+115, 179, and 243).
+The failed peers are not generic failures.
+Their reasoning repeatedly gets stuck on the same identifier-space ambiguity,
+e.g., whether ``the person wearing bib $i$'' means person $i$ or the inverse
+mapping $Q_j = i$.
+
+\paragraph{The training log shows that MOPD is actually using failed peers as teacher context.}
+At the corresponding MOPD training step, the console log records
+\texttt{self\_distillation/reprompt\_sample\_fraction = 1.0} and
+\texttt{self\_distillation/failure\_solution\_fraction = 0.99609375}
+(\texttt{wandb/run-20260504\_205407-zwlvjx6t/files/output.log}, step 1).
+This matters because the trainer code constructs a reprompt of the form
+\begin{verbatim}
+{prompt}{solution}{solution_summaries}{another_solution}{failure}{feedback}
+\end{verbatim}
+and, when failure solutions are enabled with
+\texttt{failure\_solution\_condition = always}, inserts
+\begin{verbatim}
+A known failed solution (avoid repeating this mistake):
+\end{verbatim}
+followed by a failed peer trajectory
+(\texttt{verl/trainer/ppo/ray\_trainer.py};
+\texttt{verl/workers/config/actor.py}).
+Taken together, the rollout file and the step-1 metrics imply that the
+successful bib-mapping sample is trained under a teacher prompt that almost
+certainly contains a same-task failed peer exhibiting the very same
+identifier-confusion pattern.
+
+\paragraph{Why this is the cleanest causal evidence we have.}
+This is stronger than a mere before/after checkpoint comparison.
+The failure pattern is already present in the peer pool at the same training
+step, and the MOPD trainer is configured to expose such failed peers directly
+in the teacher context.
+We do not log per-token teacher logits in the current pipeline, so we cannot
+print the exact top-$k$ distribution shift at the offending identifier tokens
+from the training log alone.
+But the causal path is explicit:
+the teacher sees a concrete failed peer of the same bug family and supervises
+the student on a successful target in that augmented context.
+
+\paragraph{SDPO lacks this channel on the same training step.}
+The matched SDPO run shows the same
+\texttt{self\_distillation/reprompt\_sample\_fraction = 1.0} at step 1, but
+\texttt{self\_distillation/failure\_solution\_fraction = 0.0}
+(\texttt{wandb/run-20260505\_001730-iob9ijsm/files/output.log}, step 1).
+This difference is exactly what the run configuration encodes:
+the SDPO script defaults to
+\texttt{INCLUDE\_FAILURE\_SOLUTION=False}, whereas the MOPD-style run enables
+failed-peer context.
+So for this prompt, MOPD has a direct training-time mechanism for saying
+``here is a failed peer that confuses the identifier spaces; avoid this'',
+while SDPO does not.
+
+\subsection{Case Study 2: MOPD restores the dropped middle-character constraint}
+
+\paragraph{Candidate pair.}
+The evenly spaced \texttt{A}-\texttt{B}-\texttt{C} counting task gives a second
+clean contrast.
+At line 130, the SDPO checkpoint sample in
+\texttt{diversoty\_sdpo\_50/50.jsonl} fails with accuracy $0.825$,
+while the MOPD checkpoint sample in
+\texttt{diversoty\_mopd\_50/50.jsonl} is fully correct.
+
+\paragraph{SDPO failure.}
+The SDPO code enforces equal spacing and checks the two endpoints, but drops the
+requirement that the middle character must be \texttt{B}:
+\begin{verbatim}
+for j in range(1, n-1):
+    for i in range(j):
+        if S[i] == 'A':
+            k = 2 * j - i
+            if k < n and S[k] == 'C':
+                count += 1
+\end{verbatim}
+This overcounts invalid triples such as \texttt{A-R-C} in the test case
+\texttt{ARC}, where the correct answer is $0$.
+The failure is therefore not an algorithmic collapse but a local semantic
+omission: the code keeps the positional pattern and forgets one label
+constraint from the specification.
+
+\paragraph{MOPD success.}
+The MOPD sample reinstates the missing check explicitly:
+\begin{verbatim}
+for j in range(1, n - 1):
+    if s[j] == 'B':
+        for i in range(j):
+            if s[i] == 'A':
+                k = 2 * j - i
+                if k < n and s[k] == 'C':
+                    count += 1
+\end{verbatim}
+The resulting program is still simple and structurally close to the SDPO
+attempt, but it preserves the full symbolic constraint set.
+
+\paragraph{Takeaway.}
+This second example complements Case Study 1.
+In Case Study 1, SDPO fails because it confuses representation spaces; here it
+fails because it drops one clause from the natural-language specification.
+MOPD succeeds in both settings, suggesting that its advantage is not tied to a
+single failure type but extends across multiple forms of semantic fidelity.
+
+\subsection{Case Study 3: The first repaired MOPD rollout appears early, while SDPO still fails late}
+
+\paragraph{Candidate pair.}
+The direction-opposite task gives a cleaner training-dynamics example.
+At line 17, the SDPO checkpoint fails at both
+\texttt{diversoty\_sdpo\_50/50.jsonl} and
+\texttt{diversoty\_sdpo\_100/100.jsonl}, both with accuracy $0.0$.
+The recorded failure mode also stays format-related:
+the step-50 checkpoint is truncated, while the step-100 checkpoint is flagged
+for missing a \texttt{```python} block.
+In contrast, the MOPD checkpoint at
+\texttt{diversoty\_mopd\_50/50.jsonl} already solves the same prompt with
+accuracy $1.0$.
+
+\paragraph{Early MOPD rollout repair.}
+In the corresponding MOPD rollout stream, the first occurrence we find for this
+prompt is already correct at rollout step 10
+(\texttt{.../PTrue-ATrue-FTrue-.../10.jsonl}, line 1), with score $1.0$ and
+accuracy $1.0$.
+This makes step 10 the earliest observed point at which the repaired behavior is
+visible in training-time rollouts for this prompt.
+
+\paragraph{Late SDPO failure.}
+The corresponding SDPO rollout family still shows the same bug much later.
+At rollout step 80
+(\texttt{.../PTrue-AFalse-FFalse-.../80.jsonl}, line 65), the model again fails
+with accuracy $0.0$, and the environment feedback is
+\texttt{Incorrect Format: Put your code inside a ```python ... ``` block.}
+
+\paragraph{Takeaway.}
+For this prompt, the qualitative split is not that MOPD invents a deeper
+algorithm.
+Instead, MOPD begins to internalize the basic answer-format discipline by about
+step 10, while SDPO still has not stabilized that behavior even by the late
+rollout/checkpoint regime.
+
+\subsection{Case Study 4: MOPD shows an early correct rollout, whereas SDPO remains brittle late in training}
+
+\paragraph{Candidate pair.}
+The oyster-identification task shows the same pattern on a second prompt.
+At line 98, both SDPO checkpoints again fail:
+\texttt{diversoty\_sdpo\_50/50.jsonl} has accuracy $0.0$ with a truncated
+attempt, and \texttt{diversoty\_sdpo\_100/100.jsonl} still has accuracy $0.0$
+with an incorrect-format error.
+The matching MOPD checkpoint in
+\texttt{diversoty\_mopd\_50/50.jsonl} is fully correct.
+
+\paragraph{Early MOPD signal.}
+For this prompt, the earliest matching MOPD rollout we observe is already
+correct at rollout step 5
+(\texttt{.../PTrue-ATrue-FTrue-.../5.jsonl}, line 3), with score $1.0$ and
+accuracy $1.0$.
+This is the earliest observed rollout step where the repaired behavior appears
+for this prompt.
+
+\paragraph{Late SDPO failure.}
+SDPO remains unstable on the same task much later in training.
+At rollout step 55
+(\texttt{.../PTrue-AFalse-FFalse-.../55.jsonl}, line 14), the model still
+collapses into a fully truncated response, receiving score $0.0$ and accuracy
+$0.0$.
+
+\paragraph{Caveat and takeaway.}
+This repair is not perfectly monotone across every rollout sample:
+the MOPD stream also contains a later wrong-answer trace for the same prompt at
+step 35.
+Still, the earliest successful rollout appears very early on the MOPD side,
+whereas SDPO continues to show the same format-control failure late in training
+and still does not solve the checkpoint evaluation at steps 50 or 100.

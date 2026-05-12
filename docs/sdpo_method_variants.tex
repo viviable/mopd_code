@@ -1,0 +1,101 @@
+\section{Method: Self-Distillation Prompt Augmentation Variants}
+\label{sec:method}
+
+We study three prompt-construction variants controlled by four switches in
+\texttt{run\_local\_sdpo.sh}:
+\texttt{INCLUDE\_ANOTHER\_SOLUTION},
+\texttt{INCLUDE\_FAILURE\_SOLUTION},
+\texttt{SUMMARIZE\_SOLUTIONS}, and
+\texttt{SUMMARY\_FROM\_ALL}.
+For each training query, we have a set of rollout responses for the same instance identity $u$,
+\begin{equation}
+\mathcal{R}(u)=\{r_j\}_{j=1}^{n_u},
+\end{equation}
+with reward scores $\{y_j\}_{j=1}^{n_u}$. Using threshold $\tau$, we define
+\begin{equation}
+\mathcal{S}(u)=\{r_j\in\mathcal{R}(u): y_j\ge\tau\},\qquad
+\mathcal{F}(u)=\{r_j\in\mathcal{R}(u): y_j<\tau\}.
+\end{equation}
+
+Let $x$ be the current prompt, and let $r^{\star}\in\mathcal{S}(u)$ be the primary successful solution
+(if it exists). The teacher-augmented context is
+\begin{equation}
+\tilde{x}=x \oplus \mathcal{C}(u),
+\end{equation}
+where $\oplus$ denotes text concatenation and $\mathcal{C}(u)$ is variant-specific context.
+The policy then optimizes SDPO objective
+\begin{equation}
+\mathcal{L}_{\text{SDPO}}=(1-\alpha)\,\mathcal{L}_{\text{RL}}+\alpha\,\mathcal{L}_{\text{distill}}(\tilde{x}).
+\end{equation}
+
+\subsection{Variant 1: Another Successful Solution}
+Configuration:
+\texttt{INCLUDE\_ANOTHER\_SOLUTION=True}.
+
+When $|\mathcal{S}(u)|\ge 2$, we select an additional successful response
+$r^{+}\in\mathcal{S}(u)\setminus\{r^{\star}\}$ and form
+\begin{equation}
+\mathcal{C}_1(u)=\texttt{Template}(r^{\star})\oplus\texttt{AnotherTemplate}(r^{+}).
+\end{equation}
+If only one success is available, $\mathcal{C}_1(u)$ reduces to the primary-solution block.
+This variant increases successful-solution diversity while keeping all demonstrations positive.
+
+\subsection{Variant 2: Another Success + Failure-Aware Fallback}
+Configuration:
+\texttt{INCLUDE\_ANOTHER\_SOLUTION=True},
+\texttt{INCLUDE\_FAILURE\_SOLUTION=True}.
+
+This variant keeps Variant 1 behavior when a success exists.
+Additionally, when $\mathcal{S}(u)=\varnothing$, we sample a failure
+$r^{-}\sim\mathcal{F}(u)$ and provide it as a negative demonstration:
+\begin{equation}
+\mathcal{C}_2(u)=
+\begin{cases}
+\mathcal{C}_1(u), & \text{if } \mathcal{S}(u)\neq\varnothing,\\
+\texttt{FailureTemplate}(r^{-}), & \text{if } \mathcal{S}(u)=\varnothing.
+\end{cases}
+\end{equation}
+Thus, the model either imitates good trajectories or explicitly avoids known bad trajectories.
+
+\subsection{Variant 3: Summary Distillation from All Responses}
+Configuration:
+\texttt{INCLUDE\_ANOTHER\_SOLUTION=False},
+\texttt{INCLUDE\_FAILURE\_SOLUTION=False},
+\texttt{SUMMARIZE\_SOLUTIONS=True},
+\texttt{SUMMARY\_FROM\_ALL=True}.
+
+For each candidate response $r_j$, we extract a compact summary
+$s_j=\texttt{ExtractSummary}(r_j)$ (or a short fallback excerpt if missing).
+Given summary budget $k$, we sample
+\begin{equation}
+\mathcal{P}_k(u)\subseteq \mathcal{R}(u)\setminus\{r^{\star}\},\qquad |\mathcal{P}_k(u)|\le k,
+\end{equation}
+and construct
+\begin{equation}
+\mathcal{C}_3(u)=\texttt{Template}(r^{\star})\oplus
+\bigoplus_{r_j\in\mathcal{P}_k(u)}
+\texttt{SummaryTemplate}_{\ell_j}(s_j),
+\end{equation}
+where label $\ell_j\in\{\text{success},\text{failure}\}$ is determined by $y_j\ge\tau$.
+Compared with full-solution injection, this variant exposes broader behavioral coverage
+(success and failure) with lower context length.
+
+\subsection{Unified View}
+All three variants can be written as
+\begin{equation}
+\mathcal{C}(u)=\texttt{Template}(r^{\star})\oplus
+\lambda_{+}\,\mathcal{A}_{+}(u)\oplus
+\lambda_{-}\,\mathcal{A}_{-}(u)\oplus
+\lambda_{\Sigma}\,\mathcal{A}_{\Sigma}(u),
+\end{equation}
+where $(\lambda_{+},\lambda_{-},\lambda_{\Sigma})\in\{0,1\}^3$ are switch-controlled gates for
+additional success, failure demonstration, and summary blocks, respectively.
+The three settings correspond to:
+\begin{equation}
+\text{V1}:(1,0,0),\qquad
+\text{V2}:(1,1,0),\qquad
+\text{V3}:(0,0,1;\,\texttt{SUMMARY\_FROM\_ALL}=\texttt{True}).
+\end{equation}
+
+In practice, Variant 1 emphasizes positive imitation, Variant 2 improves robustness under sparse success,
+and Variant 3 trades token-level detail for higher response diversity via summary-level distillation.
