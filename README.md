@@ -2,7 +2,7 @@
 
 # Multi-Rollout On-Policy Distillation (MOPD)
 
-[![Paper](https://img.shields.io/badge/paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2601.20802)  [![Github](https://img.shields.io/badge/Code-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/viviable/mopd_code)
+[![Code](https://img.shields.io/badge/Code-Anonymous-000000?style=for-the-badge&logo=github&logoColor=white)](https://anonymous.4open.science/r/mopd_code-C7BC)
 
 </div>
 
@@ -14,8 +14,7 @@
   </p>
   <p>
     <a href="#-configuration-reference" style="text-decoration: none; font-weight: bold;">⚙️ Configuration Reference</a> •
-    <a href="#-teacher-signal-analysis" style="text-decoration: none; font-weight: bold;">🔬 Teacher Signal Analysis</a> •
-    <a href="#citation" style="text-decoration: none; font-weight: bold;">Citation</a>
+    <a href="#-teacher-signal-analysis" style="text-decoration: none; font-weight: bold;">🔬 Teacher Signal Analysis</a>
   </p>
 </div>
 
@@ -155,7 +154,7 @@ Convert to parquet (required for training):
 python data/preprocess.py --data_source DATASET_PATH
 ```
 
-**Math training data (DeepMath-103K):** Download from [Hugging Face](https://huggingface.co/datasets/zwhe99/DeepMath-103K) and preprocess with `data/preprocess.py`.
+**Math training data:** Download the standard DeepMath-103K corpus from its public release and preprocess with `data/preprocess.py`.
 
 ---
 
@@ -218,7 +217,7 @@ bash experiments/rich_feedback/run_baseline_grpo.sh
 
 ## ⚙️ Configuration Reference
 
-MOPD extends the base verl `self_distillation` block in `verl/trainer/config/actor/actor.yaml`.
+MOPD extends the base `self_distillation` block in `trainer/config/actor/actor.yaml`.
 
 ### Peer-Context Settings
 
@@ -324,19 +323,6 @@ bash diversity/run_diversity.sh
 
 ---
 
-## Citation
-
-```bibtex
-@article{yu2026mopd,
-  title   = {Multi-Rollout On-Policy Distillation via Peer Successes and Failures},
-  author  = {Yu, Weichen and Li, Xiaomin and Zhao, Yizhou and Liu, Xiaoze and
-             Zhang, Ruowang and Wang, Haixin and Luo, Yinyi and Wu, Chen Henry and
-             Mittal, Gaurav and Fredrikson, Matt and Hu, Yu},
-  year    = {2026},
-  journal = {arXiv preprint},
-}
-```
-
 ## Attribution
 
-Our implementation is built on top of [SDPO](https://github.com/lasgroup/SDPO) and [verl](https://github.com/volcengine/verl).
+Our implementation builds on prior open-source on-policy distillation and RL training frameworks. Specific upstream projects will be acknowledged in the camera-ready version.
