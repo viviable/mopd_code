@@ -229,7 +229,13 @@ class vLLMAsyncRollout(BaseRollout):
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
-        self.inference_engine.load_model(*args, **kwargs)
+        load_model = getattr(self.inference_engine, "load_model", None)
+        if callable(load_model):
+            load_model(*args, **kwargs)
+        else:
+            # vLLM 0.8.x keeps load_model on the wrapped worker and exposes it
+            # via execute_method instead of a callable wrapper attribute.
+            self.inference_engine.execute_method("load_model", *args, **kwargs)
         _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
 
     async def _execute_method(self, method: str | bytes, *args, **kwargs):

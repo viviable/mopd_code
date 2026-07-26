@@ -781,6 +781,178 @@ class RayPPOTrainer:
         match = _re.search(rf'<{tag}>(.*?)</{tag}>', text, _re.DOTALL)
         return match.group(1).strip() if match else None
 
+    def _build_control_peers(
+        self,
+        *,
+        mode: str,
+        match: str,
+        batch_size: int,
+        uids_list,
+        success_by_uid: dict,
+        fail_by_uid: dict,
+        success_set: set,
+        primary_solution_idxs: list,
+        response_texts: list,
+        response_mask: torch.Tensor,
+        include_primary_solution: bool,
+        include_another_solution: bool,
+        include_failure_solution: bool,
+        failure_solution_condition: str,
+        dont_reprompt_on_self_success: bool,
+        remove_thinking: bool,
+    ) -> tuple[list[list[str]], list[list[str]], int]:
+        """Build matched-budget control peers per sample (ablations).
+
+        For each sample, first re-derives the 2-success-1-failure baseline
+        reference (how many success/failure blocks it would use and their token
+        lengths), then fills that budget with control peers:
+          - "random_peer": same #success/#failure block labels, filled by peers
+                sampled at random from the same rollout group (ignoring their
+                verifier label); "token" match picks the length-closest peer.
+          - "unrelated_prompt": every block filled by a successful rollout from a
+                DIFFERENT prompt.
+          - "success_only_matched": every block filled by a successful rollout
+                from the SAME prompt (failure slot replaced by an extra success);
+                tops up from other prompts' successes if the same prompt lacks
+                enough successes.
+        "block" match reproduces the baseline block count; "token" match
+        reproduces the baseline cumulative demonstration token length.
+
+        Returns (control_success_texts, control_failure_texts, topup_count).
+        """
+        import random as _random
+
+        response_lengths = [int(x) for x in response_mask.sum(dim=1).tolist()]
+        global_success = sorted(success_set)
+
+        def _text(j: int) -> str:
+            txt = response_texts[j]
+            return self._remove_thinking_trace(txt) if remove_thinking else txt
+
+        def _pick_by_length(available: list, target_len: int):
+            return min(available, key=lambda j: abs(response_lengths[j] - target_len))
+
+        def _pick_slots(available: list, target_lens: list) -> list[int]:
+            """Pick len(target_lens) distinct peers, length-matched in token mode."""
+            avail = list(available)
+            picked: list[int] = []
+            for slot, tlen in enumerate(target_lens):
+                if not avail:
+                    break
+                choice = _pick_by_length(avail, tlen) if match == "token" else _random.choice(avail)
+                picked.append(choice)
+                avail.remove(choice)
+            return picked
+
+        def _pick_budget(available: list, n_blocks: int, target_tokens: int) -> list[int]:
+            """Pick success blocks matching the budget.
+
+            In block mode picks n_blocks distinct peers; in token mode keeps adding
+            distinct peers until cumulative token length reaches target_tokens.
+            """
+            avail = list(available)
+            picked: list[int] = []
+            tot = 0
+            if match == "token":
+                while avail and tot < target_tokens:
+                    choice = _random.choice(avail)
+                    picked.append(choice)
+                    avail.remove(choice)
+                    tot += response_lengths[choice]
+            else:
+                for _ in range(n_blocks):
+                    if not avail:
+                        break
+                    choice = _random.choice(avail)
+                    picked.append(choice)
+                    avail.remove(choice)
+            return picked
+
+        control_success_texts: list[list[str]] = [[] for _ in range(batch_size)]
+        control_failure_texts: list[list[str]] = [[] for _ in range(batch_size)]
+        topup_count = 0
+
+        for i in range(batch_size):
+            uid = uids_list[i]
+            succ_idxs = list(success_by_uid.get(uid, []))
+            if dont_reprompt_on_self_success:
+                succ_idxs = [j for j in succ_idxs if j != i]
+            fail_idxs = [j for j in fail_by_uid.get(uid, []) if j != i]
+            primary_idx = primary_solution_idxs[i]
+
+            # --- Baseline 2S1F reference: which slots would be occupied + lengths ---
+            ref_success_lens: list[int] = []
+            if include_primary_solution and primary_idx is not None:
+                ref_success_lens.append(response_lengths[primary_idx])
+            if include_another_solution and len(succ_idxs) >= 2:
+                ref_success_lens.append(response_lengths[succ_idxs[1]])
+            ref_failure_lens: list[int] = []
+            failure_available = (
+                include_failure_solution
+                and len(fail_idxs) > 0
+                and (failure_solution_condition == "always" or primary_idx is None)
+            )
+            if failure_available:
+                ref_failure_lens.append(response_lengths[fail_idxs[0]])
+
+            n_success = len(ref_success_lens)
+            n_failure = len(ref_failure_lens)
+            n_blocks = n_success + n_failure
+            if n_blocks == 0:
+                continue
+            target_tokens = sum(ref_success_lens) + sum(ref_failure_lens)
+
+            same_group = [j for j in (succ_idxs + fail_idxs)]  # all peers in group (excl self)
+
+            if mode == "random_peer":
+                # Keep the same success/failure label composition, but fill each
+                # slot with a peer chosen at random from the group, ignoring its
+                # true verifier label.
+                pool = list(same_group)
+                success_picks = _pick_slots(pool, ref_success_lens)
+                pool = [j for j in pool if j not in success_picks]
+                failure_picks = _pick_slots(pool, ref_failure_lens)
+                control_success_texts[i] = [_text(j) for j in success_picks]
+                control_failure_texts[i] = [_text(j) for j in failure_picks]
+
+            elif mode == "unrelated_prompt":
+                # All blocks are successes drawn from OTHER prompts.
+                pool = [j for j in global_success if uids_list[j] != uid]
+                picks = _pick_budget(pool, n_blocks, target_tokens)
+                control_success_texts[i] = [_text(j) for j in picks]
+
+            elif mode == "success_only_matched":
+                # All blocks are successes from the SAME prompt; top up from other
+                # prompts' successes if this prompt has too few.
+                same_success = [j for j in succ_idxs]
+                picks = _pick_budget(same_success, n_blocks, target_tokens)
+                # Determine whether we still need more to hit the budget.
+                if match == "token":
+                    need_more = sum(response_lengths[j] for j in picks) < target_tokens
+                else:
+                    need_more = len(picks) < n_blocks
+                if need_more:
+                    topup_pool = [j for j in global_success if uids_list[j] != uid and j not in picks]
+                    if match == "token":
+                        cur = sum(response_lengths[j] for j in picks)
+                        avail = list(topup_pool)
+                        while avail and cur < target_tokens:
+                            choice = _random.choice(avail)
+                            picks.append(choice)
+                            avail.remove(choice)
+                            cur += response_lengths[choice]
+                            topup_count += 1
+                    else:
+                        avail = list(topup_pool)
+                        while avail and len(picks) < n_blocks:
+                            choice = _random.choice(avail)
+                            picks.append(choice)
+                            avail.remove(choice)
+                            topup_count += 1
+                control_success_texts[i] = [_text(j) for j in picks]
+
+        return control_success_texts, control_failure_texts, topup_count
+
     def _add_summary_instruction_to_batch(self, gen_batch: DataProto, summary_instruction: str) -> DataProto:
         """Append summary_instruction to the last user message of each sample's raw_prompt.
 
@@ -880,6 +1052,43 @@ class RayPPOTrainer:
                 for i in range(batch_size)
             ]
 
+        # Matched-budget peer controls (ablations). When active, they
+        # take over the primary/another/failure solution slots: each sample is
+        # given control_success_texts (rendered with success templates) and
+        # control_failure_texts (failure template), keeping the same per-sample
+        # block count / token budget as the 2-success-1-failure baseline.
+        peer_control_mode = self_distillation_cfg.get("peer_control_mode", "none")
+        peer_control_match = self_distillation_cfg.get("peer_control_match", "block")
+        control_mode = peer_control_mode != "none"
+        control_success_texts: list[list[str]] = [[] for _ in range(batch_size)]
+        control_failure_texts: list[list[str]] = [[] for _ in range(batch_size)]
+        control_topup_count = 0
+        control_block_total = 0
+        control_success_block_total = 0
+        control_failure_block_total = 0
+        if control_mode:
+            control_success_texts, control_failure_texts, control_topup_count = self._build_control_peers(
+                mode=peer_control_mode,
+                match=peer_control_match,
+                batch_size=batch_size,
+                uids_list=uids_list,
+                success_by_uid=success_by_uid,
+                fail_by_uid=fail_by_uid,
+                success_set=success_set,
+                primary_solution_idxs=primary_solution_idxs,
+                response_texts=response_texts,
+                response_mask=response_mask,
+                include_primary_solution=include_primary_solution,
+                include_another_solution=include_another_solution,
+                include_failure_solution=include_failure_solution,
+                failure_solution_condition=failure_solution_condition,
+                dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                remove_thinking=remove_thinking,
+            )
+            control_success_block_total = sum(len(s) for s in control_success_texts)
+            control_failure_block_total = sum(len(f) for f in control_failure_texts)
+            control_block_total = control_success_block_total + control_failure_block_total
+
         # Solution summaries: sample k other responses (excl. self and primary),
         # extract their <summary> tags, and build a concatenated block per sample.
         # When summary_from_all=True, samples from all responses (success + failure) and
@@ -895,7 +1104,7 @@ class RayPPOTrainer:
         sampled_summary_fallback = 0
         summary_candidates = 0
         summary_tag_available_total = 0
-        if summarize_solutions:
+        if summarize_solutions and not control_mode:
             import random as _random
             tag = self_distillation_cfg.get("summary_tag", "summary")
             k = self_distillation_cfg.get("summary_k", 1)
@@ -942,9 +1151,21 @@ class RayPPOTrainer:
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_another_solution = another_solution_strs[i] is not None
-            has_failure_solution = failure_solution_strs[i] is not None
+            if control_mode:
+                # Control peers take over the solution slots. The first success
+                # block reuses the primary solution template; any additional
+                # success blocks use the "another solution" template.
+                succ_blocks = control_success_texts[i]
+                fail_blocks = control_failure_texts[i]
+                has_solution = len(succ_blocks) > 0
+                has_another_solution = len(succ_blocks) > 1
+                has_failure_solution = len(fail_blocks) > 0
+            else:
+                succ_blocks = None
+                fail_blocks = None
+                has_solution = solution_strs[i] is not None
+                has_another_solution = another_solution_strs[i] is not None
+                has_failure_solution = failure_solution_strs[i] is not None
             has_solution_summaries = solution_summary_strs[i] != ""
             has_feedback = feedback_list[i] is not None
             feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
@@ -955,8 +1176,9 @@ class RayPPOTrainer:
             # build solution section
             solution_section = ""
             if has_solution:
+                primary_text = succ_blocks[0] if control_mode else solution_strs[i]
                 solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
+                    successful_previous_attempt=primary_text
                 )
 
             # build solution summaries section (k blocks concatenated)
@@ -965,16 +1187,32 @@ class RayPPOTrainer:
             # build another solution section
             another_solution_section = ""
             if has_another_solution:
-                another_solution_section = self_distillation_cfg.another_solution_template.format(
-                    another_successful_attempt=another_solution_strs[i]
-                )
+                if control_mode:
+                    another_solution_section = "".join(
+                        self_distillation_cfg.another_solution_template.format(
+                            another_successful_attempt=txt
+                        )
+                        for txt in succ_blocks[1:]
+                    )
+                else:
+                    another_solution_section = self_distillation_cfg.another_solution_template.format(
+                        another_successful_attempt=another_solution_strs[i]
+                    )
 
             # build failure solution section
             failure_section = ""
             if has_failure_solution:
-                failure_section = self_distillation_cfg.failure_solution_template.format(
-                    failed_attempt=failure_solution_strs[i]
-                )
+                if control_mode:
+                    failure_section = "".join(
+                        self_distillation_cfg.failure_solution_template.format(
+                            failed_attempt=txt
+                        )
+                        for txt in fail_blocks
+                    )
+                else:
+                    failure_section = self_distillation_cfg.failure_solution_template.format(
+                        failed_attempt=failure_solution_strs[i]
+                    )
 
             # build feedback section
             feedback_section = ""
@@ -1031,11 +1269,16 @@ class RayPPOTrainer:
         # (i.e., any of: primary solution, another solution, failure solution, solution summaries, or feedback is used)
         self_distillation_mask = torch.tensor(
             [
-                solution_strs[i] is not None
+                (
+                    (len(control_success_texts[i]) > 0 or len(control_failure_texts[i]) > 0)
+                    if control_mode else (
+                        solution_strs[i] is not None
+                        or another_solution_strs[i] is not None
+                        or failure_solution_strs[i] is not None
+                        or solution_summary_strs[i] != ""
+                    )
+                )
                 or feedback_used[i]
-                or another_solution_strs[i] is not None
-                or failure_solution_strs[i] is not None
-                or solution_summary_strs[i] != ""
                 for i in range(batch_size)
             ],
             dtype=torch.float32,
@@ -1084,6 +1327,15 @@ class RayPPOTrainer:
             "self_distillation/summary_sampled_fallback_fraction": (
                 sampled_summary_fallback / sampled_summary_total if sampled_summary_total > 0 else 0.0
             ),
+            # Matched-budget peer control diagnostics (0 when peer_control_mode="none").
+            "self_distillation/peer_control_active": 1.0 if control_mode else 0.0,
+            "self_distillation/peer_control_block_total": float(control_block_total),
+            "self_distillation/peer_control_success_block_total": float(control_success_block_total),
+            "self_distillation/peer_control_failure_block_total": float(control_failure_block_total),
+            "self_distillation/peer_control_blocks_per_sample": (
+                control_block_total / batch_size if batch_size > 0 else 0.0
+            ),
+            "self_distillation/peer_control_topup_count": float(control_topup_count),
         }
         tensors = {
             "teacher_input_ids": teacher_input_ids,
@@ -2144,6 +2396,14 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        # Per-sample scalar verified reward, consumed by on-policy DPO/SimPO
+                        # pairing and verified-success SFT filtering. Only added for those
+                        # loss modes so the GRPO/SDPO batches are byte-for-byte unchanged.
+                        _pref_loss_mode = self.config.actor_rollout_ref.actor.get("policy_loss", {}).get(
+                            "loss_mode", "vanilla"
+                        )
+                        if _pref_loss_mode in ("dpo", "simpo", "sft", "verified_sft"):
+                            batch.batch["sequence_reward"] = reward_tensor.sum(dim=-1)
                         metrics.update(self._update_uid_success_tracking(batch, reward_tensor))
 
                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)

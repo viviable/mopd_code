@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,13 @@ def read_variant_config(path: str | None) -> dict[str, Any]:
                 },
                 {"name": "failure_only", "include_failure_solution": True},
                 {"name": "random_summary_control", "include_summary": True, "summary_control": "random_other_prompt", "summary_k": 2},
+                # Matched-budget controls (mirror the training-side peer controls).
+                # random_peer: keep the 2S1F slot structure (2 success slots + 1 failure slot)
+                #   but fill each slot with a random same-prompt peer, ignoring its true label.
+                # verifier_score_ordered: take the top-N peers by verifier score (reward), N = the
+                #   same 2S1F block budget, rendered best->worst (top-N are usually all successes).
+                {"name": "random_peer", "peer_control": "random"},
+                {"name": "verifier_score_ordered", "peer_control": "score_ordered"},
             ],
         }
     with Path(path).open() as f:
@@ -187,6 +195,77 @@ def select_random_control_summaries(
         if len(selected) >= summary_k:
             break
     return selected
+
+
+def select_random_peers(
+    rows: list[dict[str, Any]],
+    self_response_id: str,
+    n_peers: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Pick n random same-prompt peers (excluding self), ignoring their success label."""
+    others = [row for row in rows if row["response_id"] != self_response_id]
+    if n_peers <= 0 or not others:
+        return []
+    order = list(range(len(others)))
+    random.Random(seed).shuffle(order)
+    return [others[i] for i in order[:n_peers]]
+
+
+def select_score_ordered_peers(
+    rows: list[dict[str, Any]],
+    self_response_id: str,
+    n_peers: int,
+) -> list[dict[str, Any]]:
+    """Take the top-n same-prompt peers (excluding self) by verifier score (reward), best first."""
+    others = [row for row in rows if row["response_id"] != self_response_id]
+    if n_peers <= 0 or not others:
+        return []
+    others_sorted = sorted(others, key=lambda row: (-float(row["reward"]), str(row["response_id"])))
+    return others_sorted[:n_peers]
+
+
+def render_peer_sections(
+    success_slot_peers: list[dict[str, Any]],
+    failure_slot_peers: list[dict[str, Any]],
+) -> tuple[str, str, str, list[str], dict[str, bool]]:
+    """Render selected peers into the same (solution / another_solution / failure) slots used by 2S1F."""
+    evidence_ids: list[str] = []
+    sections_used = {
+        "solution": False,
+        "another_solution": False,
+        "failure_solution": False,
+        "feedback": False,
+        "summary": False,
+    }
+    solution_section = ""
+    another_solution_section = ""
+    failure_section = ""
+
+    if success_slot_peers:
+        solution_section = DEFAULT_SOLUTION_TEMPLATE.format(
+            successful_previous_attempt=success_slot_peers[0]["response_text"]
+        )
+        evidence_ids.append(f"{success_slot_peers[0]['response_id']}::response_full")
+        sections_used["solution"] = True
+        rest = success_slot_peers[1:]
+        if rest:
+            another_solution_section = "".join(
+                DEFAULT_ANOTHER_SOLUTION_TEMPLATE.format(another_successful_attempt=row["response_text"])
+                for row in rest
+            )
+            evidence_ids.extend(f"{row['response_id']}::response_full" for row in rest)
+            sections_used["another_solution"] = True
+
+    if failure_slot_peers:
+        failure_section = "".join(
+            DEFAULT_FAILURE_TEMPLATE.format(failed_attempt=row["response_text"])
+            for row in failure_slot_peers
+        )
+        evidence_ids.extend(f"{row['response_id']}::response_full" for row in failure_slot_peers)
+        sections_used["failure_solution"] = True
+
+    return solution_section, another_solution_section, failure_section, evidence_ids, sections_used
 
 
 def build_summary_block(
@@ -344,6 +423,46 @@ def build_variant_rows(
                     evidence_ids.extend(summary_evidence_ids)
                     sections_used["summary"] = True
 
+            # Matched-budget peer controls: override the solution/failure slots. The block budget
+            # is derived from what 2S1F would occupy for THIS candidate, so length/#blocks match.
+            peer_control = variant.get("peer_control")
+            if peer_control:
+                another = select_another_solution(
+                    prompt_rows,
+                    self_response_id=self_response_id,
+                    primary_response_id=primary_response_id,
+                    dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                )
+                failure = select_failure_solution(prompt_rows, self_response_id=self_response_id)
+                n_success_slots = (1 if primary is not None else 0) + (1 if another is not None else 0)
+                n_failure_slots = 1 if failure is not None else 0
+                if peer_control == "random":
+                    seed = int(
+                        hashlib.sha1(f"{candidate['prompt_id']}|{self_response_id}".encode("utf-8")).hexdigest(),
+                        16,
+                    ) % (2**32)
+                    picked = select_random_peers(
+                        prompt_rows, self_response_id, n_success_slots + n_failure_slots, seed
+                    )
+                    success_slot_peers = picked[:n_success_slots]
+                    failure_slot_peers = picked[n_success_slots : n_success_slots + n_failure_slots]
+                else:  # score_ordered
+                    picked = select_score_ordered_peers(
+                        prompt_rows, self_response_id, n_success_slots + n_failure_slots
+                    )
+                    success_slot_peers = [row for row in picked if row["success"]]
+                    failure_slot_peers = [row for row in picked if not row["success"]]
+                (
+                    solution_section,
+                    another_solution_section,
+                    failure_section,
+                    evidence_ids,
+                    sections_used,
+                ) = render_peer_sections(success_slot_peers, failure_slot_peers)
+                feedback_section = ""
+                solution_summaries_section = ""
+                summary_sources = []
+
             if should_use_reprompt(variant, sections_used):
                 assembled_context_text = assemble_reprompt(
                     prompt=candidate["prompt"],
@@ -377,6 +496,7 @@ def build_variant_rows(
                         "summary_from_all": bool(variant.get("summary_from_all", False)),
                         "summary_k": summary_k,
                         "summary_control": variant.get("summary_control"),
+                        "peer_control": variant.get("peer_control"),
                         "dont_reprompt_on_self_success": dont_reprompt_on_self_success,
                         "feedback_only_without_solution": feedback_only_without_solution,
                     },

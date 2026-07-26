@@ -14,6 +14,7 @@
   </p>
   <p>
     <a href="#-configuration-reference" style="text-decoration: none; font-weight: bold;">⚙️ Configuration Reference</a> •
+    <a href="#-additional-baselines--ablations" style="text-decoration: none; font-weight: bold;">🧩 Baselines &amp; Ablations</a> •
     <a href="#-teacher-signal-analysis" style="text-decoration: none; font-weight: bold;">🔬 Teacher Signal Analysis</a>
   </p>
 </div>
@@ -265,6 +266,91 @@ failure_solution_template: |-
 
 ---
 
+## 🧩 Additional Baselines & Ablations
+
+This release adds two capabilities on top of the core MOPD trainer: (1) a family of
+**on-policy preference / filtered-SFT baselines** that reuse the exact same rollout
+budget as GRPO/MOPD, and (2) **matched-budget peer-control ablations** that isolate
+*what* in the peer context drives the gains (the same-prompt success–failure contrast)
+from confounds like context length and demonstration count. All additions are
+opt-in — with the default config, GRPO/MOPD batches are byte-for-byte unchanged.
+
+### 1. On-policy DPO / SimPO / verified-success SFT baselines
+
+**Purpose.** Provide apples-to-apples baselines under an identical rollout
+budget. Preference pairs (DPO/SimPO) are formed *within* each rollout group (shared
+`uid`): any higher-verified-reward sample is "chosen" over a lower one; verified-success
+SFT (a.k.a. rejection-sampling / STaR) simply does NLL on the self-generated rollouts
+that pass verification. Selected via `actor.policy_loss.loss_mode ∈ {dpo, simpo, sft}`.
+
+| Loss mode | What it does | Reference policy |
+|---|---|---|
+| `dpo` | Within-group DPO on verified reward; cDPO label smoothing supported | required (auto-enabled) |
+| `simpo` | Reference-free, length-normalized preference loss with a target margin | not needed |
+| `sft` / `verified_sft` | NLL on verified-success rollouts only (filter-then-SFT) | not needed |
+
+**Code changed:**
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/core_algos.py` | New `compute_preference_loss` (DPO/SimPO) and `compute_verified_sft_loss`, plus a `_sequence_log_probs` helper |
+| `verl/workers/actor/dp_actor.py` | Dispatch the new `dpo`/`simpo`/`sft` loss modes; select `sequence_reward` (and `ref_log_prob`/`uid` where needed) into the micro-batch |
+| `verl/trainer/ppo/ray_trainer.py` | Attach a per-sample scalar `sequence_reward` (summed verified reward) to the batch, only for these loss modes |
+| `verl/trainer/ppo/utils.py` | `need_reference_policy` now returns `True` for `loss_mode == dpo` (DPO needs reference log-probs even without a KL term) |
+| `verl/workers/config/actor.py`, `verl/trainer/config/actor/actor.yaml` | New `policy_loss` fields: `dpo_beta`, `simpo_beta`, `simpo_gamma`, `pref_label_smoothing`, `sft_success_threshold`, `sft_length_normalize` |
+| `verl/trainer/config/{dpo,simpo,verified_sft}.yaml` *(new)* | Ready-to-use configs for each baseline |
+| `run_local_{dpo,simpo,sft}.sh` *(new)* | Launch scripts mirroring `run_local_sdpo.sh` |
+
+```bash
+DATA_PATH=datasets/lcb_v6 bash run_local_dpo.sh    # on-policy DPO
+DATA_PATH=datasets/lcb_v6 bash run_local_simpo.sh  # SimPO
+DATA_PATH=datasets/lcb_v6 bash run_local_sft.sh    # verified-success SFT
+```
+
+### 2. Matched-budget peer-control ablations
+
+**Purpose.** The 2-success-1-failure (2S1F) MOPD context differs from a bare GRPO
+prompt in three ways at once: it adds tokens, adds demonstrations, and adds the
+same-prompt success/failure structure. These controls hold the **block count / token
+budget fixed** and vary only *what fills the slots*, so the same-instance contrast can
+be credited (or not) on its own.
+
+Set via `actor_rollout_ref.actor.self_distillation.peer_control_mode` (with
+`peer_control_match ∈ {block, token}`):
+
+| `peer_control_mode` | Fills the 2S1F slots with… |
+|---|---|
+| `none` (default) | Standard MOPD (primary + another + failure) |
+| `random_peer` | Same #success/#failure slots, but each slot is a peer sampled at random from the group, ignoring its verifier label |
+| `unrelated_prompt` | Successful rollouts drawn from *other* prompts (no same-instance structure) |
+| `success_only_matched` | Successes from the *same* prompt only (failure slot replaced by an extra success), isolating the failure-as-negative-evidence term |
+
+**Code changed:**
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/ray_trainer.py` | New `_build_control_peers` (re-derives each sample's 2S1F budget, then fills it with control peers); control peers take over the solution/failure slots in `_maybe_build_self_distillation_batch`, with `self_distillation/peer_control_*` diagnostics logged |
+| `verl/workers/config/actor.py`, `verl/trainer/config/actor/actor.yaml` | New `self_distillation.peer_control_mode` / `peer_control_match` with validation |
+| `run_local_sdpo.sh` | `PEER_CONTROL_MODE` / `PEER_CONTROL_MATCH` env plumbing; when active, pins the 2S1F context so the baseline row and controls share one context; run tag distinguishes the four rows |
+
+The offline **teacher-signal** analysis gets matching controls plus statistics:
+
+| File | Change |
+|---|---|
+| `analysis/build_context_variants.py` | New `random_peer` and `verifier_score_ordered` (top-N by reward) control variants, matched to the 2S1F slot budget |
+| `analysis/compute_teacher_signal_metrics.py` | Prompt-level bootstrap 95% CIs; a "both-present" sample set (prompts with ≥1 success *and* ≥1 failure, where AUC/pairwise-accuracy are well-defined); a Table-7 markdown/CSV export (`--num-bootstrap`, `--table-sample-set`) |
+| `analysis/plot_teacher_metrics.py` | CI error bars, extra palette colors, and the two new conditions / sample sets |
+| `analysis/run_ana.sh` | Wires the new conditions, bootstrap CIs, and the both-present plot into the pipeline |
+
+### 3. vLLM 0.8.x compatibility fix
+
+`verl/workers/rollout/vllm_rollout/vllm_rollout.py` — `_load_model` now falls back to
+`execute_method("load_model", …)` when the engine does not expose a callable
+`load_model` attribute (vLLM 0.8.x keeps it on the wrapped worker), so rollout startup
+works across vLLM versions.
+
+---
+
 ## 🔬 Teacher Signal Analysis
 
 The `analysis/` directory contains scripts to reproduce the self-teacher signal quality evaluation from Section 5.3 of the paper.
@@ -325,4 +411,4 @@ bash diversity/run_diversity.sh
 
 ## Attribution
 
-Our implementation builds on prior open-source on-policy distillation and RL training frameworks. Specific upstream projects will be acknowledged in the camera-ready version.
+Our implementation builds on prior open-source on-policy distillation and RL training frameworks. Specific upstream projects will be acknowledged in a future release.

@@ -121,6 +121,24 @@ class SelfDistillationConfig(BaseConfig):
     summary_item_template_failed: str = (
         "\nSummary of another unsuccessful solution:\n\n{summary_text}\n\n"
     )
+    # Matched-budget peer controls (ablations). When != "none", the
+    # normal 2-success-1-failure solution slots (primary/another/failure) are
+    # replaced by control peers that keep the same number of blocks / token
+    # budget but change what fills them, to isolate the same-prompt
+    # success-failure contrast from context length and demonstration count.
+    #   - "none": standard behaviour (primary + another + failure).
+    #   - "random_peer": same #success/#failure block labels, but each block is
+    #        filled by a peer sampled at random from the same rollout group,
+    #        ignoring its verifier label (length-matched random peer control).
+    #   - "unrelated_prompt": all blocks filled by successful rollouts drawn
+    #        from OTHER prompts (no same-instance structure).
+    #   - "success_only_matched": all blocks filled by successes from the SAME
+    #        prompt (failure slot replaced by an extra success), isolating the
+    #        failure-as-negative-evidence term.
+    peer_control_mode: str = "none"
+    # How the control matches the baseline budget: "block" matches the number of
+    # peer blocks; "token" matches the cumulative demonstration token length.
+    peer_control_match: str = "block"
     step_level_kl: bool = False
     step_separator: str = "\n\n"
 
@@ -156,6 +174,18 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 "self_distillation.summary_source must be one of "
                 f"{valid_summary_sources}, got {self.summary_source}"
+            )
+        valid_peer_control_modes = ["none", "random_peer", "unrelated_prompt", "success_only_matched"]
+        if self.peer_control_mode not in valid_peer_control_modes:
+            raise ValueError(
+                "self_distillation.peer_control_mode must be one of "
+                f"{valid_peer_control_modes}, got {self.peer_control_mode}"
+            )
+        valid_peer_control_matches = ["block", "token"]
+        if self.peer_control_match not in valid_peer_control_matches:
+            raise ValueError(
+                "self_distillation.peer_control_match must be one of "
+                f"{valid_peer_control_matches}, got {self.peer_control_match}"
             )
 
 
@@ -201,6 +231,13 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        dpo_beta (float): DPO temperature (used when loss_mode == 'dpo').
+        simpo_beta (float): SimPO temperature (used when loss_mode == 'simpo').
+        simpo_gamma (float): SimPO target reward margin (used when loss_mode == 'simpo').
+        pref_label_smoothing (float): cDPO/robust label smoothing in [0, 0.5) for dpo/simpo.
+        sft_success_threshold (float): Minimum verified reward to count a rollout as a
+            success for verified-success SFT (loss_mode == 'sft').
+        sft_length_normalize (bool): Whether verified-success SFT averages NLL per token.
     """
 
     loss_mode: str = "vanilla"
@@ -209,6 +246,13 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    # DPO / SimPO / verified-success SFT (on-policy over rollout groups)
+    dpo_beta: float = 0.1
+    simpo_beta: float = 2.0
+    simpo_gamma: float = 1.0
+    pref_label_smoothing: float = 0.0
+    sft_success_threshold: float = 1.0
+    sft_length_normalize: bool = True
 
 
 @dataclass

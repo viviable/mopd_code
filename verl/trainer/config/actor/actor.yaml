@@ -75,6 +75,24 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # DPO temperature (loss_mode == 'dpo')
+  dpo_beta: 0.1
+
+  # SimPO temperature (loss_mode == 'simpo')
+  simpo_beta: 2.0
+
+  # SimPO target reward margin (loss_mode == 'simpo')
+  simpo_gamma: 1.0
+
+  # cDPO/robust label smoothing in [0, 0.5) for dpo/simpo
+  pref_label_smoothing: 0.0
+
+  # Minimum verified reward to count a rollout as success for verified-success SFT
+  sft_success_threshold: 1.0
+
+  # Whether verified-success SFT averages NLL per token within a sequence
+  sft_length_normalize: true
+
 # self-distillation config
 self_distillation:
 
@@ -191,6 +209,11 @@ self_distillation:
   summary_source: success
   summary_from_all: False
   summary_item_template_failed: "\nSummary of another unsuccessful solution:\n\n{summary_text}\n\n"
+  # Matched-budget peer-control experiments (controls). "none" = normal MOPD.
+  # none | random_peer | unrelated_prompt | success_only_matched
+  peer_control_mode: none
+  # How to match the 2S1F budget: "block" (same #blocks) or "token" (same token count)
+  peer_control_match: block
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

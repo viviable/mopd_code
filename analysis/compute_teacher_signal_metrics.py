@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import random as _random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -25,16 +26,50 @@ CONDITION_TO_REQUIRED_SECTIONS = {
     "solution+feedback+summary_all_k2": {"solution", "summary"},
     "feedback": {"feedback"},
     "random_summary_control": {"summary"},
+    "random_peer": {"solution"},
+    "verifier_score_ordered": {"solution"},
     "base": set(),
     "base_raw": set(),
     "base_reprompt": set(),
 }
+
+# Aggregate metric name -> per-prompt metric key it averages over (used for bootstrap CIs).
+AGG_TO_PROMPT_KEY = {
+    "mean_spearman": "spearman",
+    "mean_kendall_tau": "kendall_tau",
+    "pairwise_accuracy": "pairwise_accuracy",
+    "success_auc": "success_auc",
+    "success_point_biserial": "success_point_biserial",
+    "success_brier_sigmoid": "success_brier_sigmoid",
+    "success_brier_minmax": "success_brier_minmax",
+    "top1_hit_rate": "top1_hit_rate",
+}
+
+# Bootstrap settings for prompt-level 95% CIs. Overridable from main() via CLI.
+BOOTSTRAP_NUM = 2000
+BOOTSTRAP_SEED = 12345
+BOOTSTRAP_ALPHA = 0.05
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute offline teacher-signal ranking metrics.")
     parser.add_argument("--input", required=True, help="Teacher-scored JSONL file.")
     parser.add_argument("--output", required=True, help="Aggregate JSON output path.")
+    parser.add_argument(
+        "--num-bootstrap",
+        type=int,
+        default=BOOTSTRAP_NUM,
+        help="Number of prompt-level bootstrap resamples for 95%% CIs.",
+    )
+    parser.add_argument(
+        "--table-output",
+        help="Optional path for a markdown Table 7 (main metrics + CIs). Defaults to <output stem>_table7.md; a .csv sibling is also written.",
+    )
+    parser.add_argument(
+        "--table-sample-set",
+        default="both_present_effective_only",
+        help="Which sample set to render into Table 7.",
+    )
     return parser.parse_args()
 
 
@@ -181,6 +216,53 @@ def brier_score(probabilities: list[float], labels: list[int]) -> float:
     )
 
 
+def percentile(sorted_values: list[float], q: float) -> float:
+    """Linear-interpolation percentile of an already-sorted list; q in [0, 1]."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = q * (len(sorted_values) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return sorted_values[lo]
+    frac = pos - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def bootstrap_cis(
+    per_prompt_metrics: list[dict[str, Any]],
+    agg_to_key: dict[str, str],
+    num_boot: int = BOOTSTRAP_NUM,
+    seed: int = BOOTSTRAP_SEED,
+    alpha: float = BOOTSTRAP_ALPHA,
+) -> dict[str, list[float]]:
+    """Prompt-level bootstrap: resample prompts with replacement, recompute each metric mean.
+
+    Returns {agg_metric_name: [ci_low, ci_high]}. All metrics share the same resampled prompt
+    indices per iteration so their CIs are mutually consistent.
+    """
+    n = len(per_prompt_metrics)
+    if n == 0:
+        return {agg: [0.0, 0.0] for agg in agg_to_key}
+    # Pre-extract per-prompt value arrays once.
+    columns = {agg: [float(m[key]) for m in per_prompt_metrics] for agg, key in agg_to_key.items()}
+    rng = _random.Random(seed)
+    boot_means: dict[str, list[float]] = {agg: [] for agg in agg_to_key}
+    for _ in range(num_boot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        for agg, col in columns.items():
+            boot_means[agg].append(sum(col[i] for i in idx) / n)
+    lo_q = alpha / 2.0
+    hi_q = 1.0 - alpha / 2.0
+    out: dict[str, list[float]] = {}
+    for agg, means in boot_means.items():
+        means.sort()
+        out[agg] = [percentile(means, lo_q), percentile(means, hi_q)]
+    return out
+
+
 def group_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str, Any]]]]:
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
@@ -243,7 +325,9 @@ def compute_condition_metrics(rows_by_prompt: dict[str, list[dict[str, Any]]]) -
     for item in per_prompt_metrics:
         by_bucket[item["difficulty_bucket"]].append(item)
 
-    return {
+    cis = bootstrap_cis(per_prompt_metrics, AGG_TO_PROMPT_KEY)
+
+    result = {
         "count_prompts": len(per_prompt_metrics),
         "mean_spearman": average([x["spearman"] for x in per_prompt_metrics]),
         "mean_kendall_tau": average([x["kendall_tau"] for x in per_prompt_metrics]),
@@ -270,6 +354,9 @@ def compute_condition_metrics(rows_by_prompt: dict[str, list[dict[str, Any]]]) -
             for bucket, items in sorted(by_bucket.items())
         },
     }
+    for agg, ci in cis.items():
+        result[f"{agg}_ci"] = ci
+    return result
 
 
 def required_sections_for_condition(condition: str) -> set[str]:
@@ -334,6 +421,75 @@ def build_paired_subset(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+TABLE7_METRICS = ["mean_spearman", "mean_kendall_tau", "pairwise_accuracy", "success_auc"]
+TABLE7_CONDITION_ORDER = [
+    "base",
+    "solution",
+    "another_solution",
+    "failure_solution",
+    "solution+failure_solution",
+    "all_solutions",
+    "random_peer",
+    "verifier_score_ordered",
+    "solution+another_solution+failure_solution",
+]
+
+
+def _fmt_ci(cond_metrics: dict[str, Any], metric: str) -> str:
+    value = cond_metrics.get(metric)
+    ci = cond_metrics.get(f"{metric}_ci")
+    if value is None:
+        return "n/a"
+    if not ci:
+        return f"{value:.3f}"
+    return f"{value:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]"
+
+
+def write_table7(result: dict[str, Any], sample_set: str, md_path: Path, csv_path: Path) -> None:
+    """Emit Table 7: main ranking metrics + 95% CIs, one row per condition, for one sample set."""
+    split = result["sample_sets"].get(sample_set)
+    if split is None:
+        print(f"[table7] sample set {sample_set!r} not found; skipping table.")
+        return
+    conditions_view = split["conditions"]
+    ordered = [c for c in TABLE7_CONDITION_ORDER if c in conditions_view]
+    ordered += [c for c in sorted(conditions_view) if c not in ordered]
+
+    header = ["condition", "count_prompts", *TABLE7_METRICS]
+    md_lines = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
+    csv_lines = [",".join(header)]
+    for cond in ordered:
+        cm = conditions_view[cond]
+        n = cm.get("count_prompts", 0)
+        md_cells = [cond, str(n)] + [_fmt_ci(cm, m) for m in TABLE7_METRICS]
+        md_lines.append("| " + " | ".join(md_cells) + " |")
+        csv_cells = [cond, str(n)]
+        for m in TABLE7_METRICS:
+            value = cm.get(m)
+            ci = cm.get(f"{m}_ci") or [None, None]
+            csv_cells += [
+                "" if value is None else f"{value:.6f}",
+                "" if ci[0] is None else f"{ci[0]:.6f}",
+                "" if ci[1] is None else f"{ci[1]:.6f}",
+            ]
+        csv_lines.append(",".join(csv_cells))
+    # CSV header needs per-metric ci columns; rebuild to match rows.
+    csv_header = ["condition", "count_prompts"]
+    for m in TABLE7_METRICS:
+        csv_header += [m, f"{m}_ci_low", f"{m}_ci_high"]
+    csv_lines[0] = ",".join(csv_header)
+
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(
+        f"# Table 7: teacher-signal ranking metrics ({sample_set})\n\n"
+        + "Values are prompt-mean with prompt-level bootstrap 95% CI in brackets.\n\n"
+        + "\n".join(md_lines)
+        + "\n"
+    )
+    csv_path.write_text("\n".join(csv_lines) + "\n")
+    print(f"Wrote Table 7 to {md_path} and {csv_path}")
+
+
 def write_json(path: Path, obj: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -343,6 +499,8 @@ def write_json(path: Path, obj: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    global BOOTSTRAP_NUM
+    BOOTSTRAP_NUM = int(args.num_bootstrap)
     rows = read_jsonl(Path(args.input))
     validate_rows(rows)
     rows = add_effective_flags(rows)
@@ -355,10 +513,22 @@ def main() -> int:
     reward_zero_effective_rows = [row for row in reward_zero_rows if row["effective_for_condition"]]
     reward_zero_effective_grouped = group_rows(reward_zero_effective_rows)
 
+    # Both-present subset: prompts whose candidate group contains BOTH >=1 success and >=1 failure.
+    labels_by_prompt: dict[str, set[int]] = defaultdict(set)
+    for row in rows:
+        labels_by_prompt[row["prompt_id"]].add(1 if row["success"] else 0)
+    both_present_prompts = {p for p, labels in labels_by_prompt.items() if 0 in labels and 1 in labels}
+    both_present_rows = [row for row in rows if row["prompt_id"] in both_present_prompts]
+    both_present_grouped = group_rows(both_present_rows)
+    both_present_effective_rows = [row for row in both_present_rows if row["effective_for_condition"]]
+    both_present_effective_grouped = group_rows(both_present_effective_rows)
+
     all_counts = defaultdict(int)
     effective_counts = defaultdict(int)
     reward_zero_counts = defaultdict(int)
     reward_zero_effective_counts = defaultdict(int)
+    both_present_counts = defaultdict(int)
+    both_present_effective_counts = defaultdict(int)
     for row in rows:
         all_counts[row["condition"]] += 1
         if row["effective_for_condition"]:
@@ -367,6 +537,10 @@ def main() -> int:
             reward_zero_counts[row["condition"]] += 1
             if row["effective_for_condition"]:
                 reward_zero_effective_counts[row["condition"]] += 1
+        if row["prompt_id"] in both_present_prompts:
+            both_present_counts[row["condition"]] += 1
+            if row["effective_for_condition"]:
+                both_present_effective_counts[row["condition"]] += 1
 
     result = {
         "input": args.input,
@@ -391,6 +565,16 @@ def main() -> int:
                 "conditions": compute_split(reward_zero_effective_grouped),
                 "paired_by_target_type": build_paired_subset(reward_zero_effective_rows),
             },
+            "both_present_all": {
+                "description": "Only prompts whose candidate group has BOTH >=1 success and >=1 failure. AUC / pairwise accuracy are only well-defined here.",
+                "conditions": compute_split(both_present_grouped),
+                "paired_by_target_type": build_paired_subset(both_present_rows),
+            },
+            "both_present_effective_only": {
+                "description": "Both-present prompts, restricted to samples where the requested context sections were actually present. Primary subset for the 2S1F-vs-controls claim.",
+                "conditions": compute_split(both_present_effective_grouped),
+                "paired_by_target_type": build_paired_subset(both_present_effective_rows),
+            },
         },
         "condition_sample_counts": {
             condition: {
@@ -398,6 +582,8 @@ def main() -> int:
                 "effective_only": effective_counts[condition],
                 "reward_zero_only": reward_zero_counts[condition],
                 "reward_zero_effective_only": reward_zero_effective_counts[condition],
+                "both_present_all": both_present_counts[condition],
+                "both_present_effective_only": both_present_effective_counts[condition],
             }
             for condition in sorted(
                 set(all_counts)
@@ -406,9 +592,18 @@ def main() -> int:
                 | set(reward_zero_effective_counts)
             )
         },
+        "both_present_prompt_count": len(both_present_prompts),
     }
     write_json(Path(args.output), result)
     print(f"Wrote teacher signal metrics to {args.output}")
+
+    out_path = Path(args.output)
+    if args.table_output:
+        md_path = Path(args.table_output)
+    else:
+        md_path = out_path.with_name(f"{out_path.stem}_table7.md")
+    csv_path = md_path.with_suffix(".csv")
+    write_table7(result, args.table_sample_set, md_path, csv_path)
     return 0
 
 

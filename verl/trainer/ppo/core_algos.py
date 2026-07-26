@@ -1229,6 +1229,174 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+def _sequence_log_probs(log_prob: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Sum per-token log-probs over the response tokens of each sequence.
+
+    Args:
+        log_prob (torch.Tensor): (bsz, response_length) per-token log-probs.
+        response_mask (torch.Tensor): (bsz, response_length) 1 for response tokens.
+
+    Returns:
+        torch.Tensor: (bsz,) summed log-prob per sequence.
+    """
+    return (log_prob * response_mask).sum(dim=-1)
+
+
+def compute_preference_loss(
+    loss_mode: str,
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    uid: np.ndarray,
+    sequence_reward: torch.Tensor,
+    *,
+    ref_log_prob: Optional[torch.Tensor] = None,
+    beta: float = 0.1,
+    simpo_gamma: float = 0.5,
+    label_smoothing: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """On-policy DPO / SimPO loss over rollout groups.
+
+    Preference pairs are formed *within* each rollout group (same ``uid``): any
+    sample with a strictly higher ``sequence_reward`` is "chosen" over any lower
+    reward sample in the same group ("rejected"). This keeps the rollout budget
+    matched with GRPO/MOPD (identical ``n`` rollouts per prompt), and the loss is
+    computed only over the samples present in the current micro-batch.
+
+    DPO (needs ``ref_log_prob``):
+        logit = beta * ((logp_c - logp_ref_c) - (logp_r - logp_ref_r))
+    SimPO (reference-free, length-normalized, target margin):
+        logit = beta * (logp_c / |y_c| - logp_r / |y_r|) - simpo_gamma
+
+    loss = -log_sigmoid(logit)  (optionally label-smoothed).
+
+    Args:
+        loss_mode (str): "dpo" or "simpo".
+        log_prob (torch.Tensor): (bsz, response_length) student per-token log-probs.
+        response_mask (torch.Tensor): (bsz, response_length) response-token mask.
+        uid (np.ndarray): (bsz,) rollout-group id per sample.
+        sequence_reward (torch.Tensor): (bsz,) scalar verified reward per sample.
+        ref_log_prob (Optional[torch.Tensor]): (bsz, response_length) reference
+            per-token log-probs. Required for "dpo", ignored for "simpo".
+        beta (float): DPO/SimPO temperature.
+        simpo_gamma (float): SimPO target reward margin (0 for DPO).
+        label_smoothing (float): cDPO / robust label smoothing in [0, 0.5).
+
+    Returns:
+        tuple[torch.Tensor, dict]: scalar loss (with grad) and metrics.
+    """
+    device = log_prob.device
+    seq_len = response_mask.sum(dim=-1).clamp(min=1.0)
+    seq_logp = _sequence_log_probs(log_prob, response_mask)
+
+    if loss_mode == "simpo":
+        # length-normalized implicit reward, reference-free
+        h = seq_logp / seq_len
+        margin = simpo_gamma
+    elif loss_mode == "dpo":
+        if ref_log_prob is None:
+            raise ValueError("compute_preference_loss(dpo) requires ref_log_prob")
+        ref_seq_logp = _sequence_log_probs(ref_log_prob, response_mask).detach()
+        h = seq_logp - ref_seq_logp
+        margin = 0.0
+    else:
+        raise ValueError(f"compute_preference_loss got unsupported loss_mode={loss_mode!r}")
+
+    sequence_reward = sequence_reward.to(device=device, dtype=h.dtype)
+
+    # Build chosen/rejected index pairs within each rollout group.
+    chosen_idx: list[int] = []
+    rejected_idx: list[int] = []
+    uid_arr = np.asarray(uid)
+    rewards_np = sequence_reward.detach().float().cpu().numpy()
+    for group in np.unique(uid_arr):
+        members = np.where(uid_arr == group)[0]
+        if members.size < 2:
+            continue
+        r = rewards_np[members]
+        # all (winner, loser) combinations with a strict reward gap
+        for a in range(members.size):
+            for b in range(members.size):
+                if r[a] > r[b]:
+                    chosen_idx.append(int(members[a]))
+                    rejected_idx.append(int(members[b]))
+
+    metrics: dict[str, Any] = {}
+    num_pairs = len(chosen_idx)
+    if num_pairs == 0:
+        # No contrastive pair in this micro-batch; return a zero loss that still
+        # participates in autograd so the optimizer step is well-defined.
+        loss = h.sum() * 0.0
+        metrics[f"{loss_mode}/num_pairs"] = 0.0
+        metrics[f"{loss_mode}/accuracy"] = 0.0
+        metrics[f"{loss_mode}/reward_margin"] = 0.0
+        return loss, metrics
+
+    chosen_t = torch.as_tensor(chosen_idx, device=device, dtype=torch.long)
+    rejected_t = torch.as_tensor(rejected_idx, device=device, dtype=torch.long)
+    logits = beta * (h[chosen_t] - h[rejected_t]) - margin
+
+    # cDPO / robust label smoothing (Mitigating noise in preference labels).
+    losses = -F.logsigmoid(logits) * (1.0 - label_smoothing) - F.logsigmoid(-logits) * label_smoothing
+    loss = losses.mean()
+
+    metrics[f"{loss_mode}/num_pairs"] = float(num_pairs)
+    metrics[f"{loss_mode}/accuracy"] = (logits > 0).float().mean().item()
+    metrics[f"{loss_mode}/reward_margin"] = (h[chosen_t] - h[rejected_t]).mean().item()
+    metrics[f"{loss_mode}/logits"] = logits.mean().item()
+    return loss, metrics
+
+
+def compute_verified_sft_loss(
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    sequence_reward: torch.Tensor,
+    *,
+    success_threshold: float = 1.0,
+    length_normalize: bool = True,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Verified-success SFT (a.k.a. rejection-sampling / STaR fine-tuning).
+
+    NLL on only the rollouts whose verified reward clears ``success_threshold``.
+    This is the "filter-then-SFT" baseline: same rollout budget as GRPO/MOPD, but
+    supervised only on the self-generated successes.
+
+    Args:
+        log_prob (torch.Tensor): (bsz, response_length) per-token log-probs.
+        response_mask (torch.Tensor): (bsz, response_length) response-token mask.
+        sequence_reward (torch.Tensor): (bsz,) scalar verified reward per sample.
+        success_threshold (float): minimum reward to be counted a success.
+        length_normalize (bool): if True, average NLL per token within a sequence
+            before averaging across sequences; else sum tokens per sequence.
+
+    Returns:
+        tuple[torch.Tensor, dict]: scalar loss (with grad) and metrics.
+    """
+    device = log_prob.device
+    sequence_reward = sequence_reward.to(device=device)
+    success_mask = (sequence_reward >= success_threshold).to(log_prob.dtype)  # (bsz,)
+
+    seq_len = response_mask.sum(dim=-1).clamp(min=1.0)
+    seq_logp = _sequence_log_probs(log_prob, response_mask)
+    if length_normalize:
+        seq_nll = -seq_logp / seq_len
+    else:
+        seq_nll = -seq_logp
+
+    num_success = success_mask.sum()
+    metrics: dict[str, Any] = {}
+    if num_success.item() == 0:
+        loss = seq_logp.sum() * 0.0
+        metrics["sft/num_success"] = 0.0
+        metrics["sft/frac_success"] = 0.0
+        return loss, metrics
+
+    loss = (seq_nll * success_mask).sum() / num_success.clamp(min=1.0)
+    metrics["sft/num_success"] = num_success.item()
+    metrics["sft/frac_success"] = success_mask.mean().item()
+    metrics["sft/nll"] = loss.detach().item()
+    return loss, metrics
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,

@@ -29,7 +29,14 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_preference_loss,
+    compute_self_distillation_loss,
+    compute_verified_sft_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -682,6 +689,9 @@ class DataParallelPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         self_distillation_enabled = loss_mode == "sdpo"
+        # On-policy preference / filtered-SFT baselines over rollout groups.
+        preference_enabled = loss_mode in ("dpo", "simpo")
+        sft_enabled = loss_mode in ("sft", "verified_sft")
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
@@ -705,6 +715,15 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if preference_enabled or sft_enabled:
+            assert "sequence_reward" in data.batch.keys(), (
+                f"loss_mode={loss_mode} requires per-sample 'sequence_reward' in the batch "
+                "(added in RayPPOTrainer.fit)."
+            )
+            select_keys.append("sequence_reward")
+        if loss_mode == "dpo" and "ref_log_prob" not in select_keys:
+            # DPO needs reference log-probs even without an explicit KL loss term.
+            select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
             if "self_distillation_step_ids" in data.batch.keys():
@@ -724,6 +743,9 @@ class DataParallelPPOActor(BasePPOActor):
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("uid")
+        if preference_enabled and "uid" in data.non_tensor_batch.keys() and "uid" not in non_tensor_select_keys:
+            # Preference pairs are formed within a rollout group (shared uid).
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -850,6 +872,35 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        micro_batch_metrics.update(pg_metrics)
+                    elif preference_enabled:
+                        # On-policy DPO / SimPO: pairs are formed within a rollout
+                        # group (shared uid) using the verified sequence reward.
+                        pl_cfg = self.config.policy_loss
+                        beta = pl_cfg.get("dpo_beta", 0.1) if loss_mode == "dpo" else pl_cfg.get("simpo_beta", 2.0)
+                        pg_loss, pg_metrics = compute_preference_loss(
+                            loss_mode=loss_mode,
+                            log_prob=log_prob,
+                            response_mask=response_mask,
+                            uid=model_inputs["uid"],
+                            sequence_reward=model_inputs["sequence_reward"],
+                            ref_log_prob=model_inputs.get("ref_log_prob") if loss_mode == "dpo" else None,
+                            beta=beta,
+                            simpo_gamma=pl_cfg.get("simpo_gamma", 1.0),
+                            label_smoothing=pl_cfg.get("pref_label_smoothing", 0.0),
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+                    elif sft_enabled:
+                        # Verified-success SFT (filter-then-SFT / STaR): NLL on the
+                        # self-generated rollouts that passed verification.
+                        pl_cfg = self.config.policy_loss
+                        pg_loss, pg_metrics = compute_verified_sft_loss(
+                            log_prob=log_prob,
+                            response_mask=response_mask,
+                            sequence_reward=model_inputs["sequence_reward"],
+                            success_threshold=pl_cfg.get("sft_success_threshold", 1.0),
+                            length_normalize=pl_cfg.get("sft_length_normalize", True),
+                        )
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg

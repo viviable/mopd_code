@@ -21,8 +21,10 @@ MAIN_CONDITION_ORDER = [
     "another_solution",
     "failure_solution",
     "solution+failure_solution",
-    "solution+another_solution+failure_solution",
     "all_solutions",
+    "random_peer",
+    "verifier_score_ordered",
+    "solution+another_solution+failure_solution",
 ]
 
 LABEL_MAP = {
@@ -33,6 +35,8 @@ LABEL_MAP = {
     "solution+failure_solution": "Sol.+\nFailure",
     "solution+another_solution+failure_solution": "2 Suc.+\n1 Failure",
     "all_solutions": "All\nSolutions",
+    "random_peer": "Random\nPeer",
+    "verifier_score_ordered": "Score-Ord.\nTop-N",
 }
 
 BUCKET_ORDER = ["easy", "medium", "hard"]
@@ -44,7 +48,26 @@ PASTEL_COLORS = [
     "#F7D9A8",
     "#B8CCE4",
     "#C9B8E8",
+    "#E8C8B8",
+    "#D8C8A8",
+    "#A8D8C8",
 ]
+
+
+def condition_colors(n: int) -> list[str]:
+    return [PASTEL_COLORS[i % len(PASTEL_COLORS)] for i in range(n)]
+
+
+def ci_yerr(metrics_view: dict, conditions: list[str], metric: str, values: list[float]):
+    """Return a 2xN yerr array from `<metric>_ci` if present for all conditions, else None."""
+    lows, highs = [], []
+    for cond, value in zip(conditions, values):
+        ci = metrics_view["conditions"][cond].get(f"{metric}_ci")
+        if not ci:
+            return None
+        lows.append(max(0.0, value - ci[0]))
+        highs.append(max(0.0, ci[1] - value))
+    return [lows, highs]
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +85,8 @@ def parse_args() -> argparse.Namespace:
             "effective_only",
             "reward_zero_only",
             "reward_zero_effective_only",
+            "both_present_all",
+            "both_present_effective_only",
         ],
         default="all_samples",
         help="Which sample set from teacher_metrics.json to plot.",
@@ -106,7 +131,15 @@ def plot_main(metrics_view: dict, output_path: Path, title: str) -> None:
 
     for ax, metric in zip(axes_flat, MAIN_METRICS):
         values = [metrics_view["conditions"][cond][metric] for cond in conditions]
-        ax.bar(range(len(conditions)), values, color=PASTEL_COLORS[: len(conditions)])
+        yerr = ci_yerr(metrics_view, conditions, metric, values)
+        ax.bar(
+            range(len(conditions)),
+            values,
+            color=condition_colors(len(conditions)),
+            yerr=yerr,
+            capsize=3,
+            error_kw={"elinewidth": 1.0, "ecolor": "#333333"},
+        )
         ax.set_title(metric)
         ax.set_xticks(range(len(conditions)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
@@ -136,7 +169,7 @@ def plot_buckets(metrics_view: dict, output_path: Path, title: str) -> None:
             for cond in conditions:
                 bucket_metrics = metrics_view["conditions"][cond]["by_bucket"].get(bucket)
                 values.append(bucket_metrics[metric] if bucket_metrics else 0.0)
-            ax.bar(range(len(conditions)), values, color=PASTEL_COLORS[: len(conditions)])
+            ax.bar(range(len(conditions)), values, color=condition_colors(len(conditions)))
             if row_idx == 0:
                 ax.set_title(metric)
             if col_idx == 0:

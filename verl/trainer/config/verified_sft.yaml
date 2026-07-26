@@ -1,0 +1,43 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# MAX_PROMPT_LENGTH=2048
+# MAX_RESPONSE_LENGTH=8192
+# MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+max_model_len: 10240
+
+actor_rollout_ref:
+  actor:
+    # ppo_mini_batch_size is multiplied by rollout.n internally, so 32 -> 256 on a
+    # single GPU (== train_batch_size * n == full rollout batch, one optimizer step).
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 8
+    use_dynamic_bsz: False
+    use_kl_loss: False
+    entropy_coeff: 0.0
+    policy_loss:
+      # Verified-success SFT (filter-then-SFT / STaR): NLL on self-generated rollouts
+      # that clear sft_success_threshold. No pairing, no reference model.
+      loss_mode: sft
+      sft_success_threshold: 1.0
+      sft_length_normalize: True
+    optim:
+      lr: 1e-6
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  # GRPO advantages are computed but unused by the SFT loss path; kept so the rest of
+  # the pipeline (token_level_rewards etc.) is unchanged and the budget stays matched.
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: True
+  balance_batch: False

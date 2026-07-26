@@ -50,7 +50,7 @@ python3 analysis/score_teacher_contexts.py \
   --output analysis_outputs/lcbv6_teacher_scores_self_v2.jsonl \
   --model Qwen/Qwen3-4B-Instruct-2507 \
   --self-target-only \
-  --condition-filter base solution another_solution failure_solution solution+failure_solution all_solutions solution+another_solution+failure_solution \
+  --condition-filter base solution another_solution failure_solution solution+failure_solution all_solutions solution+another_solution+failure_solution random_peer verifier_score_ordered \
   --max-model-len 8192
 
 
@@ -65,7 +65,9 @@ python3 analysis/score_teacher_contexts.py \
 
 python3 analysis/compute_teacher_signal_metrics.py \
   --input analysis_outputs/lcbv6_teacher_scores_self_v2.jsonl \
-  --output analysis_outputs/lcbv6_teacher_scores_self_v2.json
+  --output analysis_outputs/lcbv6_teacher_scores_self_v2.json \
+  --num-bootstrap 2000 \
+  --table-sample-set both_present_effective_only
 
 ### plot
 
@@ -73,6 +75,12 @@ python3 analysis/plot_teacher_metrics.py \
   --input analysis_outputs/lcbv6_teacher_scores_self_v2.json \
   --output-dir analysis_outputs/plots_lcbv6_self_rollout_v2 \
   --sample-set effective_only
+
+## controls: 2S1F vs random-peer / verifier-score-ordered on the both-present subset (with CIs)
+python3 analysis/plot_teacher_metrics.py \
+  --input analysis_outputs/lcbv6_teacher_scores_self_v2.json \
+  --output-dir analysis_outputs/plots_lcbv6_self_rollout_v2_both_present \
+  --sample-set both_present_effective_only
 
 # python3 analysis/plot_teacher_metrics.py \
 #   --input analysis_outputs/teacher_metrics.json \

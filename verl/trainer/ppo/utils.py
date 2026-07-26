@@ -72,7 +72,13 @@ class Role(Enum):
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
-    return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+    # DPO needs reference log-probs even without an explicit KL term in the loss.
+    loss_mode = config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla")
+    return (
+        config.algorithm.use_kl_in_reward
+        or config.actor_rollout_ref.actor.use_kl_loss
+        or loss_mode == "dpo"
+    )
 
 
 def need_reward_model(

@@ -71,11 +71,30 @@ if [ "${ROLLOUT_MAX_MODEL_LEN}" -lt "${MIN_ROLLOUT_MAX_MODEL_LEN}" ]; then
 fi
 
 
-INCLUDE_ANOTHER_SOLUTION=${INCLUDE_ANOTHER_SOLUTION:-True}
-INCLUDE_FAILURE_SOLUTION=${INCLUDE_FAILURE_SOLUTION:-True}
-SUMMARIZE_SOLUTIONS=${SUMMARIZE_SOLUTIONS:-False}
-SUMMARY_FROM_ALL=${SUMMARY_FROM_ALL:-False}
-SUMMARY_K=${SUMMARY_K:-8}
+# -----------------------------------------------------------------------------
+# Matched-budget peer-control experiments (ablations).
+#   PEER_CONTROL_MODE:  none | random_peer | unrelated_prompt | success_only_matched
+#   PEER_CONTROL_MATCH: block | token   (how the control matches the baseline budget)
+# These controls, and their MOPD baseline row, must all share the same
+# 2-success-1-failure (2S1F) teacher context. Selecting this experiment family
+# (PEER_CONTROL_MODE != none, or PEER_CONTROL_EXPERIMENT=True for the baseline
+# row) therefore pins the 2S1F solution config: primary + another + failure,
+# summaries off. Explicit env overrides still win.
+PEER_CONTROL_MODE=${PEER_CONTROL_MODE:-none}
+PEER_CONTROL_MATCH=${PEER_CONTROL_MATCH:-block}
+if [ "${PEER_CONTROL_MODE}" != "none" ] || [ "${PEER_CONTROL_EXPERIMENT:-False}" = "True" ]; then
+    : "${INCLUDE_ANOTHER_SOLUTION:=True}"
+    : "${INCLUDE_FAILURE_SOLUTION:=True}"
+    : "${FAILURE_SOLUTION_CONDITION:=always}"
+    : "${SUMMARIZE_SOLUTIONS:=False}"
+    : "${SUMMARY_FROM_ALL:=False}"
+fi
+
+INCLUDE_ANOTHER_SOLUTION=${INCLUDE_ANOTHER_SOLUTION:-False}
+INCLUDE_FAILURE_SOLUTION=${INCLUDE_FAILURE_SOLUTION:-False}
+SUMMARIZE_SOLUTIONS=${SUMMARIZE_SOLUTIONS:-True}
+SUMMARY_FROM_ALL=${SUMMARY_FROM_ALL:-True}
+SUMMARY_K=${SUMMARY_K:-7}
 
 MAX_ACTOR_CKPT_TO_KEEP=2
 MAX_CRITIC_CKPT_TO_KEEP=2
@@ -192,8 +211,13 @@ export WANDB_ENTITY="safety"
 # =============================================================================
 
 MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
-TEACHER_CONTEXT_TAG="P${INCLUDE_PRIMARY_SOLUTION}-A${INCLUDE_ANOTHER_SOLUTION}-F${INCLUDE_FAILURE_SOLUTION}-FC${FAILURE_SOLUTION_CONDITION}-S${SUMMARIZE_SOLUTIONS}"
-EXP_NAME="Seed2-${TEACHER_CONTEXT_TAG}-${DATA_PATH##*/}-SDPO-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-lambda${LAMBDA}-clip_adv_high${CLIP_ADV_HIGH}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-${MODEL_NAME}-${SUFFIX}"
+TEACHER_CONTEXT_TAG="P${INCLUDE_PRIMARY_SOLUTION}-A${INCLUDE_ANOTHER_SOLUTION}-F${INCLUDE_FAILURE_SOLUTION}-FC${FAILURE_SOLUTION_CONDITION}-S${SUMMARIZE_SOLUTIONS}-K${SUMMARY_K}"
+# Tag peer-control runs so MOPD baseline + 3 controls stay distinguishable.
+PEER_TAG=""
+if [ "${PEER_CONTROL_MODE}" != "none" ]; then
+    PEER_TAG="PCM${PEER_CONTROL_MODE}-${PEER_CONTROL_MATCH}-"
+fi
+EXP_NAME="${PEER_TAG}${TEACHER_CONTEXT_TAG}-${DATA_PATH##*/}-SDPO-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-lambda${LAMBDA}-clip_adv_high${CLIP_ADV_HIGH}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-${MODEL_NAME}-${SUFFIX}"
 CKPT_DIR="${CKPT_DIR:-./checkpoints/${EXP_NAME}}"
 ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-./rollouts/${EXP_NAME}}"
 VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-./validation/${EXP_NAME}}"
@@ -239,6 +263,8 @@ ARGS=(
   "actor_rollout_ref.actor.self_distillation.summary_source=${SUMMARY_SOURCE}"
   "actor_rollout_ref.actor.self_distillation.summary_from_all=$SUMMARY_FROM_ALL"
   "actor_rollout_ref.actor.self_distillation.summary_k=$SUMMARY_K"
+  "actor_rollout_ref.actor.self_distillation.peer_control_mode=${PEER_CONTROL_MODE}"
+  "actor_rollout_ref.actor.self_distillation.peer_control_match=${PEER_CONTROL_MATCH}"
   "actor_rollout_ref.actor.optim.lr_warmup_steps=10"
   "actor_rollout_ref.rollout.val_kwargs.n=8"
 )
@@ -281,6 +307,7 @@ echo "Checkpoint dir: $CKPT_DIR"
 echo "Rollout lengths: prompt=${ROLLOUT_PROMPT_LENGTH}, response=${ROLLOUT_RESPONSE_LENGTH}, headroom=${ROLLOUT_CONTEXT_HEADROOM}, max_model_len=${ROLLOUT_MAX_MODEL_LEN}"
 echo "Summary from all: $SUMMARY_FROM_ALL"
 echo "Teacher context: primary=${INCLUDE_PRIMARY_SOLUTION}, another=${INCLUDE_ANOTHER_SOLUTION}, failure=${INCLUDE_FAILURE_SOLUTION}, failure_condition=${FAILURE_SOLUTION_CONDITION}, summarize=${SUMMARIZE_SOLUTIONS}"
+echo "Peer control: mode=${PEER_CONTROL_MODE}, match=${PEER_CONTROL_MATCH}"
 echo "Rollout data dir: ${ROLLOUT_DATA_DIR:-disabled}"
 echo "Validation data dir: ${VALIDATION_DATA_DIR:-disabled}"
 echo "Resolved GPUs: visible=${VISIBLE_GPUS}, trainer.n_gpus_per_node=${N_GPUS_PER_NODE}, rollout.tp=${ROLLOUT_TP_SIZE}"
